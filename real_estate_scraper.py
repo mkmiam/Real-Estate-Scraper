@@ -32,7 +32,7 @@ def get_driver():
     chrome_options.add_argument("--window-size=1920x1080")
     
     try:
-        driver = uc.Chrome(options=chrome_options, version_main=133)  # Specify the version of ChromeDriver
+        driver = uc.Chrome(options=chrome_options)  # Remove version_main and binary_location
         return driver
     except Exception as e:
         st.error(f"❌ Error initializing ChromeDriver: {str(e)}")

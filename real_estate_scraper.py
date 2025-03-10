@@ -1,8 +1,8 @@
-# real_estate_scraper.py
-import streamlit as st
+import  streamlit as st
 import csv
 import time
 import random
+import io
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -21,29 +21,48 @@ st.title("Property Finder with Code p2720")
 
 # User input
 cities_input = st.text_input("Enter cities (comma-separated):", "Paris, Lyon")
-cities = [c.strip() for c in cities_input.split(',') if c.strip()]
+cities = [c.strip().lower() for c in cities_input.split(',') if c.strip()]
 
 # ======= Browser Setup =======
-@st.cache_resource
 def get_driver():
     chrome_options = Options()
-    chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920x1080")
-    return uc.Chrome(options=chrome_options)
+    
+    try:
+        driver = uc.Chrome(options=chrome_options, version_main=133)  # Specify the version of ChromeDriver
+        return driver
+    except Exception as e:
+        st.error(f"❌ Error initializing ChromeDriver: {str(e)}")
+        return None
+
+# ======= Cloudflare Bypass =======
+def bypass_cloudflare(driver):
+    """Handle Cloudflare protection"""
+    try:
+        WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+    except Exception as e:
+        print(f"❌ Cloudflare challenge failed: {str(e)}")
+        raise
 
 # ======= Core Scraping Functions =======
 def search_city(driver, city_name):
     """Perform city search using the website's search bar"""
     driver.get(BASE_URL)
     
+    # Bypass Cloudflare
+    bypass_cloudflare(driver)
+    
     # Accept cookies if present
     try:
         WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.ID, "didomi-notice-agree-button"))
+            EC.element_to_be_clickable((By.XPATH, "/html/body/div[2]/div[2]/div/div/div[1]/div/div/div[1]/div[1]/div[1]/div[1]/button/span"))
         ).click()
-        st.success("✅ Accepted cookies")
+        st.success("✅ Clicked 'Do not accept' for cookies")
     except:
         pass
     
@@ -59,13 +78,32 @@ def search_city(driver, city_name):
         time.sleep(random.uniform(0.1, 0.3))
     
     # Select first suggestion
-    WebDriverWait(driver, 10).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, "div.autocomplete-suggestion"))
-    ).click()
+    for _ in range(3):  # Retry up to 3 times
+        try:
+            first_suggestion = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "li.ui-menu-item"))
+            )
+            first_suggestion.click()
+            st.success(f"✅ Selected first suggestion for {city_name}")
+            break
+        except Exception as e:
+            st.error(f"❌ Error selecting first suggestion for {city_name}: {str(e)}")
+            time.sleep(1)  # Wait a bit before retrying
+    
+    # Click the "Rechercher" button
+    try:
+        search_button = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "input.btn.btn-full-width.btn-green"))
+        )
+        search_button.click()
+        st.success("✅ Clicked 'Rechercher' button")
+    except Exception as e:
+        st.error(f"❌ Error clicking 'Rechercher' button: {str(e)}")
+    
     time.sleep(2)
 
 def extract_listings(driver, city_name):
-    """Extract and filter listings with p2720 code"""
+    """Extract and filter listings with p2720 code and nearby city detection"""
     soup = BeautifulSoup(driver.page_source, 'html.parser')
     listings = []
     
@@ -74,27 +112,44 @@ def extract_listings(driver, city_name):
             href = item['href']
             if 'p2720' not in href:
                 continue
-                
-            listings.append({
-                'City': city_name,
-                'Total Rank': idx,
-                'Page Number': 1,  # Will update in pagination
-                'Page Rank': idx,
-                'Title': item.find('img')['alt'].strip(),
-                'URL': f"{BASE_URL}{href}",
-                'Code': href.split('/')[-1].split('?')[0]
-            })
+            
+            title = item.find('img')['alt'].strip()
+            full_url = f"{BASE_URL}{href}"
+            listing_code = href.split('/')[-1].split('?')[0]
+            
+            # Normalize city name in title and href
+            normalized_title = title.replace(" ", "").lower()
+            normalized_href = href.replace(" ", "").lower()
+            
+            # Check if the offer city is similar to the searched city
+            if city_name in normalized_title or city_name in normalized_href:
+                listings.append({
+                    'City': city_name,
+                    'Total Rank': idx,
+                    'Page Number': 1,  # Will update in pagination
+                    'Page Rank': idx,
+                    'Title': title,
+                    'URL': full_url,
+                    'Code': listing_code
+                })
+            else:
+                st.warning(f"⚠️ Possible different city detected: {title} ({full_url})")
         except Exception as e:
             st.warning(f"⚠️ Error parsing listing: {str(e)}")
     
+    st.info(f"Extracted {len(listings)} listings for {city_name}")
     return listings
 
-def scrape_city(driver, city_name):
+def scrape_city(city_name):
     """Full scraping workflow for a city"""
+    driver = get_driver()
+    if not driver:
+        return []
+    
     all_results = []
     
     try:
-        with st.status(f"Scraping {city_name}...", state="running"):
+        with st.spinner(f"Scraping {city_name}..."):
             search_city(driver, city_name)
             
             # Pagination handling
@@ -112,13 +167,17 @@ def scrape_city(driver, city_name):
                 
                 # Try next page
                 try:
-                    next_btn = driver.find_element(By.CSS_SELECTOR, "a.next")
+                    next_btn = WebDriverWait(driver, 10).until(
+                        EC.element_to_be_clickable((By.LINK_TEXT, "Suivante"))
+                    )
                     driver.execute_script("arguments[0].click();", next_btn)
+                    st.info(f"Clicked next button for page {page_number}")
                     page_number += 1
                     time.sleep(2)
-                except:
+                except Exception as e:
+                    st.warning(f"⚠️ No more pages or error clicking next button: {str(e)}")
                     break
-            
+                    
             st.success(f"Found {len(all_results)} listings in {city_name}")
             
         return all_results
@@ -126,30 +185,33 @@ def scrape_city(driver, city_name):
     except Exception as e:
         st.error(f"❌ Error processing {city_name}: {str(e)}")
         return []
+    
+    finally:
+        driver.quit()
 
 # ======= Main Execution =======
 if st.button("Start Scraping"):
-    driver = get_driver()
     all_properties = []
     
     for city in cities:
-        city_results = scrape_city(driver, city)
+        st.info(f"Starting to scrape {city}")
+        city_results = scrape_city(city)
+        st.info(f"Scraped {len(city_results)} listings for {city}")
         all_properties.extend(city_results)
-        time.sleep(random.uniform(1, 3))  # Avoid rate limiting
-    
-    driver.quit()
     
     # Generate CSV
     if all_properties:
-        csv_data = []
+        csv_data = io.StringIO()
+        writer = csv.DictWriter(csv_data, fieldnames=CSV_HEADERS)
+        writer.writeheader()
         for idx, prop in enumerate(all_properties, 1):
             prop['Total Rank'] = idx
-            csv_data.append(prop)
+            writer.writerow(prop)
         
         # Create downloadable CSV
         st.download_button(
             label="Download CSV",
-            data=csv.DictWriter(st, fieldnames=CSV_HEADERS).writeheader() + '\n'.join([csv.DictWriter(st, fieldnames=CSV_HEADERS).writerow(row) for row in csv_data]),
+            data=csv_data.getvalue(),
             file_name="property_results.csv",
             mime="text/csv"
         )
